@@ -7,6 +7,21 @@ on:
   pull_request:
     branches: [main]
     types: [labeled, opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch, tag, or commit SHA to build (code only; keeps .github from dispatched ref)"
+        required: false
+        type: string
+        default: ""
+      build_target:
+        description: "Target to build"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - android
 
 permissions: write-all
 
@@ -15,6 +30,7 @@ jobs:
     name: ${{ matrix.config.variant }} ${{ matrix.config.target }} ${{ matrix.config.v8_enable_pointer_compression && 'ptrcomp' || '' }} ${{ matrix.config.simdutf && 'simdutf' || '' }}
     runs-on: ${{ matrix.config.os }}
     timeout-minutes: 180
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_target == 'all' }}
     strategy:
       # Always run main branch builds to completion. This allows the cache to
       # stay mostly up-to-date in situations where a single job fails due to
@@ -195,10 +211,32 @@ jobs:
         run: git config --global core.symlinks true
 
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 10
           submodules: recursive
+
+      - name: Checkout selected source ref
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          path: __source__
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Overlay selected source ref (excluding .github)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "Using source ref: ${{ github.event.inputs.source_ref }}"
+          shopt -s dotglob extglob
+          # Keep workflow/actions from the dispatch ref while replacing all other files.
+          rm -rf -- !(.git|.github|__source__)
+          tar --exclude='.github' -C __source__ -cf - . | tar -xf -
+          rm -rf __source__
 
       - name: Install rust
         uses: dsherret/rust-toolchain-file@v1
@@ -338,10 +376,151 @@ jobs:
           name: src_binding${{ env.FEATURES_SUFFIX }}_${{ matrix.config.variant }}_${{ matrix.config.target }}.rs
           path: target/src_binding${{ env.FEATURES_SUFFIX }}_${{ matrix.config.variant }}_${{ matrix.config.target }}.rs
 
+  build-android:
+    name: release aarch64-linux-android
+    runs-on: ${{ github.repository == 'denoland/rusty_v8' && 'ubuntu-22.04-xl' || 'ubuntu-22.04' }}
+    timeout-minutes: 180
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build_target == 'all' || github.event.inputs.build_target == 'android') }}
+    env:
+      CARGO_VARIANT_FLAG: --release
+      V8_FROM_SOURCE: true
+      LIB_NAME: librusty_v8
+      LIB_EXT: a
+      FEATURES_SUFFIX: ''
+      RUSTFLAGS: -D warnings
+
+    steps:
+      - name: Configure git
+        run: git config --global core.symlinks true
+
+      - name: Clone repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 10
+          submodules: recursive
+
+      - name: Checkout selected source ref
+        if: ${{ github.event.inputs.source_ref != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          path: __source__
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Overlay selected source ref (excluding .github)
+        if: ${{ github.event.inputs.source_ref != '' }}
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "Using source ref: ${{ github.event.inputs.source_ref }}"
+          shopt -s dotglob extglob
+          # Keep workflow/actions from the dispatch ref while replacing all other files.
+          rm -rf -- !(.git|.github|__source__)
+          tar --exclude='.github' -C __source__ -cf - . | tar -xf -
+          rm -rf __source__
+
+      - name: Install rust
+        uses: dsherret/rust-toolchain-file@v1
+
+      - name: Install python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11.x
+          architecture: x64
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26c
+          add-to-path: false
+          local-cache: true
+
+      - name: Configure Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-linux-android
+          mkdir -p third_party
+          rm -rf third_party/android_ndk
+          ln -s "${{ steps.setup-ndk.outputs.ndk-path }}" third_party/android_ndk
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${{ github.workspace }}/third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+
+      - name: Write git_submodule_status.txt
+        run: git submodule status --recursive > git_submodule_status.txt
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |-
+            target/sccache
+            target/*/.*
+            target/*/build
+            target/*/deps
+          key: cargo1-aarch64-linux-android-release-false-${{ hashFiles('Cargo.lock', 'build.rs', 'git_submodule_status.txt') }}
+          restore-keys: cargo1-aarch64-linux-android-release-false-
+
+      - name: Install and start sccache
+        shell: pwsh
+        env:
+          SCCACHE_DIR: ${{ github.workspace }}/target/sccache
+          SCCACHE_CACHE_SIZE: 256M
+          SCCACHE_IDLE_TIMEOUT: 0
+        run: |
+          $version = "v0.8.2"
+          $platform = "x86_64-unknown-linux-musl"
+          $basename = "sccache-$version-$platform"
+          $url = "https://github.com/mozilla/sccache/releases/download/$version/$basename.tar.gz"
+          cd ~
+          curl -LO $url
+          tar -xzvf "$basename.tar.gz"
+          . $basename/sccache --start-server
+          echo "$(pwd)/$basename" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Clang
+        run: |
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" | sudo dd of=/etc/apt/sources.list.d/llvm-toolchain-jammy-19.list
+          curl https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo dd of=/etc/apt/trusted.gpg.d/llvm-snapshot.gpg
+          sudo apt-get update
+          sudo apt-get -qq remove 'clang-*'
+          sudo apt-get install lld-19 clang-19 clang-tools-19 clang-tidy-19 clang-format-19 libclang-19-dev -y
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
+
+      - name: Build (cross-compile, no tests)
+        env:
+          SCCACHE_IDLE_TIMEOUT: 0
+        run: cargo build -vv --locked --target aarch64-linux-android --release
+
+      - name: Prepare binary publish
+        run: |
+          gzip -9c target/aarch64-linux-android/release/gn_out/obj/${{ env.LIB_NAME }}.${{ env.LIB_EXT }} > target/librusty_v8_release_aarch64-linux-android.a.gz
+          ls -l target/librusty_v8_release_aarch64-linux-android.a.gz
+
+          cp target/aarch64-linux-android/release/gn_out/src_binding.rs target/src_binding_release_aarch64-linux-android.rs
+          ls -l target/src_binding_release_aarch64-linux-android.rs
+
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: src_binding_release_aarch64-linux-android.rs
+          path: target/src_binding_release_aarch64-linux-android.rs
+
+      - name: Upload Android prebuilt artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-prebuilt-release-aarch64-linux-android
+          path: |
+            target/librusty_v8_release_aarch64-linux-android.a.gz
+            target/src_binding_release_aarch64-linux-android.rs
+
   build-asan:
     name: asan aarch64-apple-darwin
     runs-on: macos-15
     timeout-minutes: 180
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_target == 'all' }}
     env:
       V8_FROM_SOURCE: true
       RUSTFLAGS: -D warnings
@@ -351,10 +530,32 @@ jobs:
         run: git config --global core.symlinks true
 
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 10
           submodules: recursive
+
+      - name: Checkout selected source ref
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          path: __source__
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Overlay selected source ref (excluding .github)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "Using source ref: ${{ github.event.inputs.source_ref }}"
+          shopt -s dotglob extglob
+          # Keep workflow/actions from the dispatch ref while replacing all other files.
+          rm -rf -- !(.git|.github|__source__)
+          tar --exclude='.github' -C __source__ -cf - . | tar -xf -
+          rm -rf __source__
 
       - name: Install rust
         uses: dsherret/rust-toolchain-file@v1
@@ -420,6 +621,7 @@ jobs:
     name: release aarch64-pc-windows-msvc
     runs-on: ${{ github.repository == 'denoland/rusty_v8' && 'windows-2022-xxl' || 'windows-2022' }}
     timeout-minutes: 180
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_target == 'all' }}
     env:
       CARGO_VARIANT_FLAG: --release
       V8_FROM_SOURCE: true
@@ -432,10 +634,32 @@ jobs:
         run: git config --global core.symlinks true
 
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 10
           submodules: recursive
+
+      - name: Checkout selected source ref
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          path: __source__
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Overlay selected source ref (excluding .github)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "Using source ref: ${{ github.event.inputs.source_ref }}"
+          shopt -s dotglob extglob
+          # Keep workflow/actions from the dispatch ref while replacing all other files.
+          rm -rf -- !(.git|.github|__source__)
+          tar --exclude='.github' -C __source__ -cf - . | tar -xf -
+          rm -rf __source__
 
       - uses: dsherret/rust-toolchain-file@v1
 
@@ -522,6 +746,7 @@ jobs:
     name: release aarch64-pc-windows-msvc simdutf
     runs-on: ${{ github.repository == 'denoland/rusty_v8' && 'windows-2022-xxl' || 'windows-2022' }}
     timeout-minutes: 180
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_target == 'all' }}
     env:
       CARGO_VARIANT_FLAG: --release
       V8_FROM_SOURCE: true
@@ -534,10 +759,32 @@ jobs:
         run: git config --global core.symlinks true
 
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 10
           submodules: recursive
+
+      - name: Checkout selected source ref
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          path: __source__
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Overlay selected source ref (excluding .github)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "Using source ref: ${{ github.event.inputs.source_ref }}"
+          shopt -s dotglob extglob
+          # Keep workflow/actions from the dispatch ref while replacing all other files.
+          rm -rf -- !(.git|.github|__source__)
+          tar --exclude='.github' -C __source__ -cf - . | tar -xf -
+          rm -rf __source__
 
       - uses: dsherret/rust-toolchain-file@v1
 
@@ -616,15 +863,38 @@ jobs:
     needs: build-windows-arm64
     runs-on: ${{ github.repository == 'denoland/rusty_v8' && 'windows-11-arm-xl' || 'windows-11-arm' }}
     timeout-minutes: 60
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_target == 'all' }}
     steps:
       - name: Configure git
         run: git config --global core.symlinks true
 
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 10
           submodules: recursive
+
+      - name: Checkout selected source ref
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          path: __source__
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Overlay selected source ref (excluding .github)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "Using source ref: ${{ github.event.inputs.source_ref }}"
+          shopt -s dotglob extglob
+          # Keep workflow/actions from the dispatch ref while replacing all other files.
+          rm -rf -- !(.git|.github|__source__)
+          tar --exclude='.github' -C __source__ -cf - . | tar -xf -
+          rm -rf __source__
 
       - uses: dsherret/rust-toolchain-file@v1
 
@@ -645,16 +915,38 @@ jobs:
   publish:
     needs: [build, build-windows-arm64, build-windows-arm64-simdutf]
     runs-on: ${{ github.repository == 'denoland/rusty_v8' && 'ubuntu-22.04-xl' || 'ubuntu-22.04' }}
-    if: github.repository == 'denoland/rusty_v8' && startsWith(github.ref, 'refs/tags/')
+    if: (github.event_name != 'workflow_dispatch' || github.event.inputs.build_target == 'all') && github.repository == 'denoland/rusty_v8' && startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Configure git
         run: git config --global core.symlinks true
 
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 10
           submodules: recursive
+
+      - name: Checkout selected source ref
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          path: __source__
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Overlay selected source ref (excluding .github)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' }}
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "Using source ref: ${{ github.event.inputs.source_ref }}"
+          shopt -s dotglob extglob
+          # Keep workflow/actions from the dispatch ref while replacing all other files.
+          rm -rf -- !(.git|.github|__source__)
+          tar --exclude='.github' -C __source__ -cf - . | tar -xf -
+          rm -rf __source__
 
       - name: Install rust
         uses: dsherret/rust-toolchain-file@v1
