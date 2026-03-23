@@ -212,6 +212,20 @@ fn build_binding() {
         clang_args.push(format!("-isystem{}/include", resource_dir.trim()));
       }
     }
+  } else if target_os == "android" {
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let arch = if target_arch == "aarch64" {
+      "aarch64"
+    } else {
+      "arm"
+    };
+    let api = env::var("ANDROID_API").unwrap_or_else(|_| "24".to_string());
+    clang_args.push(format!("--target={arch}-linux-android{api}"));
+
+    let ndk_home = env::var("ANDROID_NDK_HOME").expect("ANDROID_NDK_HOME not set");
+    let sysroot = PathBuf::from(ndk_home)
+      .join("toolchains/llvm/prebuilt/linux-x86_64/sysroot");
+    clang_args.push(format!("--sysroot={}", sysroot.display()));
   }
 
   let bindings = bindgen::Builder::default()
